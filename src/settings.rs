@@ -99,6 +99,10 @@ pub struct Settings {
     /// Builder configuration.
     #[serde(default)]
     pub builder: BuilderSettings,
+
+    /// Transcription configuration.
+    #[serde(default)]
+    pub transcription: Option<TranscriptionSettings>,
 }
 
 /// Source for the secrets master key.
@@ -494,6 +498,10 @@ pub struct SandboxSettings {
     /// Additional domains to allow through the network proxy.
     #[serde(default)]
     pub extra_allowed_domains: Vec<String>,
+
+    /// Whether Claude Code sandbox mode is enabled.
+    #[serde(default)]
+    pub claude_code_enabled: bool,
 }
 
 fn default_sandbox_policy() -> String {
@@ -527,6 +535,7 @@ impl Default for SandboxSettings {
             image: default_sandbox_image(),
             auto_pull_image: true,
             extra_allowed_domains: Vec::new(),
+            claude_code_enabled: false,
         }
     }
 }
@@ -598,6 +607,14 @@ impl Default for BuilderSettings {
             auto_register: true,
         }
     }
+}
+
+/// Transcription pipeline settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionSettings {
+    /// Whether audio transcription is enabled.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Settings {
