@@ -17,12 +17,12 @@
 - **Claude Code mode**: Delegate jobs to Claude CLI inside containers
 - **Skills system**: SKILL.md prompt extensions with trust model, tool attenuation, and ClawHub registry
 - **Routines**: Scheduled (cron) and reactive (event, webhook) task execution
-- **Web gateway**: Browser UI with SSE/WebSocket real-time streaming
+- **Web gateway**: Browser UI with SSE/WebSocket real-time streaming, PID-based lock prevents multiple instances
 - **Extension management**: Install, auth, activate MCP/WASM extensions
 - **Extensible tools**: Built-in tools, WASM sandbox, MCP client, dynamic builder
 - **Persistent memory**: Workspace with hybrid search (FTS + vector via RRF)
 - **Prompt injection defense**: Sanitizer, validator, policy rules, leak detection, shell env scrubbing
-- **Multi-provider LLM**: NEAR AI, OpenAI, Anthropic, Ollama, OpenAI-compatible, Tinfoil private inference
+- **Multi-provider LLM**: NEAR AI, OpenAI, Anthropic, Ollama, OpenAI-compatible, Tinfoil private inference, AWS Bedrock (requires `--features bedrock`)
 - **Setup wizard**: 7-step interactive onboarding for first-run configuration
 - **Heartbeat system**: Proactive periodic execution with checklist
 
@@ -189,6 +189,7 @@ src/
 │   │   ├── file.rs     # ReadFile, WriteFile, ListDir, ApplyPatch
 │   │   ├── shell.rs    # Shell command execution
 │   │   ├── memory.rs   # Memory tools (search, write, read, tree)
+│   │   ├── image_gen.rs, image_edit.rs, image_analyze.rs # Image generation/editing/analysis
 │   │   ├── message.rs  # MessageTool: agent proactively messages users on any channel
 │   │   ├── job.rs      # CreateJob, ListJobs, JobStatus, CancelJob
 │   │   ├── routine.rs  # routine_create/list/update/delete/history
@@ -429,6 +430,9 @@ NEARAI_BASE_URL=https://private.near.ai
 # NEARAI_API_KEY=...                    # API key from cloud.near.ai
 NEARAI_MODEL=claude-3-5-sonnet-20241022
 
+# LLM request timeout (applies to all providers)
+LLM_REQUEST_TIMEOUT_SECS=120             # Default: 120 seconds
+
 # Agent settings
 AGENT_NAME=ironclaw
 MAX_PARALLEL_JOBS=5
@@ -583,8 +587,9 @@ Instructions for the agent when this skill activates...
 
 1. **Gating** -- Check binary/env/config requirements; skip skills whose prerequisites are missing
 2. **Scoring** -- Deterministic scoring against message content using keywords, tags, and regex patterns
-3. **Budget** -- Select top-scoring skills that fit within `SKILLS_MAX_TOKENS` prompt budget
-4. **Attenuation** -- Apply trust-based tool ceiling; installed skills lose access to dangerous tools
+3. **Veto** -- Skills with `exclude_keywords` matching message content are vetoed (score = 0)
+4. **Budget** -- Select top-scoring skills that fit within `SKILLS_MAX_TOKENS` prompt budget
+5. **Attenuation** -- Apply trust-based tool ceiling; installed skills lose access to dangerous tools
 
 ### Skill Tools
 
@@ -649,7 +654,7 @@ Key test patterns:
 
 1. **Domain-specific tools** - `marketplace.rs`, `restaurant.rs`, `taskrabbit.rs`, `ecommerce.rs` return placeholder responses; need real API integrations
 2. **Integration tests** - Need testcontainers setup for PostgreSQL
-3. **MCP stdio transport** - Only HTTP transport implemented
+3. **MCP stdio/UDS transports** - Transport abstraction implemented; stdio, UDS, and HTTP transports available
 4. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
 5. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
 6. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
