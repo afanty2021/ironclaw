@@ -6,8 +6,11 @@
 //! - **Anthropic**: Direct API access with your own key
 //! - **Ollama**: Local model inference
 //! - **OpenAI-compatible**: Any endpoint that speaks the OpenAI API
+//! - **AWS Bedrock**: Native Converse API via aws-sdk-bedrockruntime
 
 mod anthropic_oauth;
+#[cfg(feature = "bedrock")]
+mod bedrock;
 pub mod circuit_breaker;
 pub mod costs;
 pub mod failover;
@@ -21,6 +24,9 @@ pub mod retry;
 mod rig_adapter;
 pub mod session;
 pub mod smart_routing;
+
+pub mod image_models;
+pub mod vision_models;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use failover::{CooldownConfig, FailoverProvider};
@@ -54,12 +60,29 @@ use crate::error::LlmError;
 ///
 /// - NearAI backend: Uses session manager for authentication
 /// - Registry providers: Looked up by protocol and constructed generically
-pub fn create_llm_provider(
+pub async fn create_llm_provider(
     config: &LlmConfig,
     session: Arc<SessionManager>,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let timeout = config.request_timeout_secs;
+
     if config.backend == "nearai" || config.backend == "near_ai" || config.backend == "near" {
-        return create_llm_provider_with_config(&config.nearai, session);
+        return create_llm_provider_with_config(&config.nearai, session, timeout);
+    }
+
+    // Bedrock uses a native AWS SDK, not the rig-core registry
+    if config.backend == "bedrock" {
+        #[cfg(feature = "bedrock")]
+        {
+            return create_bedrock_provider(config).await;
+        }
+        #[cfg(not(feature = "bedrock"))]
+        {
+            return Err(LlmError::RequestFailed {
+                provider: "bedrock".to_string(),
+                reason: "Bedrock support not compiled. Rebuild with --features bedrock".to_string(),
+            });
+        }
     }
 
     let reg_config = config
@@ -79,6 +102,7 @@ pub fn create_llm_provider(
 pub fn create_llm_provider_with_config(
     config: &NearAiConfig,
     session: Arc<SessionManager>,
+    request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     let auth_mode = if config.api_key.is_some() {
         "API key"
@@ -89,9 +113,14 @@ pub fn create_llm_provider_with_config(
         model = %config.model,
         base_url = %config.base_url,
         auth = auth_mode,
+        timeout_secs = request_timeout_secs,
         "Using NEAR AI (Chat Completions API)"
     );
-    Ok(Arc::new(NearAiChatProvider::new(config.clone(), session)?))
+    Ok(Arc::new(NearAiChatProvider::new_with_timeout(
+        config.clone(),
+        session,
+        request_timeout_secs,
+    )?))
 }
 
 /// Create a provider from a registry-resolved config.
@@ -107,6 +136,24 @@ fn create_registry_provider(
         ProviderProtocol::Anthropic => create_anthropic_from_registry(config),
         ProviderProtocol::Ollama => create_ollama_from_registry(config),
     }
+}
+
+#[cfg(feature = "bedrock")]
+async fn create_bedrock_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let br = config
+        .bedrock
+        .as_ref()
+        .ok_or_else(|| LlmError::AuthFailed {
+            provider: "bedrock".to_string(),
+        })?;
+
+    let provider = bedrock::BedrockProvider::new(br).await?;
+    tracing::info!(
+        "Using AWS Bedrock (Converse API, region: {}, model: {})",
+        br.region,
+        provider.active_model_name(),
+    );
+    Ok(Arc::new(provider))
 }
 
 fn create_openai_compat_from_registry(
@@ -333,7 +380,7 @@ pub fn create_cheap_llm_provider(
 /// This is the single source of truth for provider chain construction,
 /// called by both `main.rs` and `app.rs`.
 #[allow(clippy::type_complexity)]
-pub fn build_provider_chain(
+pub async fn build_provider_chain(
     config: &LlmConfig,
     session: Arc<SessionManager>,
 ) -> Result<
@@ -344,7 +391,7 @@ pub fn build_provider_chain(
     ),
     LlmError,
 > {
-    let llm = create_llm_provider(config, session.clone())?;
+    let llm = create_llm_provider(config, session.clone()).await?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
     // 1. Retry
@@ -365,7 +412,11 @@ pub fn build_provider_chain(
     let llm: Arc<dyn LlmProvider> = if let Some(ref cheap_model) = config.nearai.cheap_model {
         let mut cheap_config = config.nearai.clone();
         cheap_config.model = cheap_model.clone();
-        let cheap = create_llm_provider_with_config(&cheap_config, session.clone())?;
+        let cheap = create_llm_provider_with_config(
+            &cheap_config,
+            session.clone(),
+            config.request_timeout_secs,
+        )?;
         let cheap: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(cheap, retry_config.clone()))
         } else {
@@ -397,7 +448,11 @@ pub fn build_provider_chain(
         }
         let mut fallback_config = config.nearai.clone();
         fallback_config.model = fallback_model.clone();
-        let fallback = create_llm_provider_with_config(&fallback_config, session.clone())?;
+        let fallback = create_llm_provider_with_config(
+            &fallback_config,
+            session.clone(),
+            config.request_timeout_secs,
+        )?;
         tracing::info!(
             primary = %llm.model_name(),
             fallback = %fallback.model_name(),
@@ -503,6 +558,8 @@ mod tests {
             session: SessionConfig::default(),
             nearai: test_nearai_config(),
             provider: None,
+            bedrock: None,
+            request_timeout_secs: 120,
         }
     }
 
