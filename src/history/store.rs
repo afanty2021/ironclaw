@@ -149,18 +149,23 @@ impl Store {
             r#"
             INSERT INTO agent_jobs (
                 id, conversation_id, title, description, category, status, source,
+                user_id,
                 budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                actual_cost, repair_attempts, created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                actual_cost, repair_attempts, max_tokens, total_tokens_used,
+                created_at, started_at, completed_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
                 category = EXCLUDED.category,
                 status = EXCLUDED.status,
+                user_id = EXCLUDED.user_id,
                 estimated_cost = EXCLUDED.estimated_cost,
                 estimated_time_secs = EXCLUDED.estimated_time_secs,
                 actual_cost = EXCLUDED.actual_cost,
                 repair_attempts = EXCLUDED.repair_attempts,
+                max_tokens = EXCLUDED.max_tokens,
+                total_tokens_used = EXCLUDED.total_tokens_used,
                 started_at = EXCLUDED.started_at,
                 completed_at = EXCLUDED.completed_at
             "#,
@@ -172,6 +177,7 @@ impl Store {
                 &ctx.category,
                 &status,
                 &"direct", // source
+                &ctx.user_id,
                 &ctx.budget,
                 &ctx.budget_token,
                 &ctx.bid_amount,
@@ -179,6 +185,8 @@ impl Store {
                 &estimated_time_secs,
                 &ctx.actual_cost,
                 &(ctx.repair_attempts as i32),
+                &(ctx.max_tokens as i64),
+                &(ctx.total_tokens_used as i64),
                 &ctx.created_at,
                 &ctx.started_at,
                 &ctx.completed_at,
@@ -198,7 +206,8 @@ impl Store {
                 r#"
                 SELECT id, conversation_id, title, description, category, status, user_id,
                        budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                       actual_cost, repair_attempts, created_at, started_at, completed_at
+                       actual_cost, repair_attempts, max_tokens, total_tokens_used,
+                       created_at, started_at, completed_at
                 FROM agent_jobs WHERE id = $1
                 "#,
                 &[&id],
@@ -234,8 +243,9 @@ impl Store {
                     completed_at: row.get("completed_at"),
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
-                    total_tokens_used: 0,
-                    max_tokens: 0,
+                    max_tokens: row.get::<_, Option<i64>>("max_tokens").unwrap_or(0) as u64,
+                    total_tokens_used: row.get::<_, Option<i64>>("total_tokens_used").unwrap_or(0)
+                        as u64,
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),
                     http_interceptor: None,
                     tool_output_stash: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1084,7 +1094,7 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT * FROM routines WHERE enabled AND trigger_type = 'event'",
+                "SELECT * FROM routines WHERE enabled AND trigger_type IN ('event', 'system_event')",
                 &[],
             )
             .await?;
@@ -1397,25 +1407,31 @@ pub struct ConversationMessage {
 impl Store {
     /// Ensure a conversation row exists for a given UUID.
     ///
-    /// Idempotent: inserts on first call, bumps `last_activity` on subsequent calls.
+    /// Returns `true` when the row is inserted or refreshed for the same
+    /// `(channel, user_id)`. Returns `false` when the UUID already exists but
+    /// belongs to a different owner/channel.
     pub async fn ensure_conversation(
         &self,
         id: Uuid,
         channel: &str,
         user_id: &str,
         thread_id: Option<&str>,
-    ) -> Result<(), DatabaseError> {
+    ) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;
-        conn.execute(
-            r#"
+        let affected = conn
+            .execute(
+                r#"
             INSERT INTO conversations (id, channel, user_id, thread_id)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE SET last_activity = NOW()
+            ON CONFLICT (id) DO UPDATE
+            SET last_activity = NOW()
+            WHERE conversations.user_id = EXCLUDED.user_id
+              AND conversations.channel = EXCLUDED.channel
             "#,
-            &[&id, &channel, &user_id, &thread_id],
-        )
-        .await?;
-        Ok(())
+                &[&id, &channel, &user_id, &thread_id],
+            )
+            .await?;
+        Ok(affected > 0)
     }
 
     /// List conversations with a title derived from the first user message.
@@ -2132,5 +2148,37 @@ mod tests {
             };
             assert_eq!(summary.channel, ch);
         }
+    }
+
+    /// Regression test: save_job must persist user_id and get_job must return it.
+    /// Requires a running PostgreSQL instance (integration tier).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore]
+    async fn test_save_job_persists_user_id() {
+        use crate::config::Config;
+        use crate::context::JobContext;
+
+        let _ = dotenvy::dotenv();
+        let config = Config::from_env().await.expect("Failed to load config");
+        let store = Store::new(&config.database)
+            .await
+            .expect("Failed to connect to database");
+        store
+            .run_migrations()
+            .await
+            .expect("Failed to run migrations");
+
+        let ctx = JobContext::with_user("test-user-42", "PG user_id test", "regression test");
+        store.save_job(&ctx).await.unwrap();
+
+        let loaded = store.get_job(ctx.job_id).await.unwrap().unwrap();
+        assert_eq!(loaded.user_id, "test-user-42");
+
+        // Clean up
+        let conn = store.conn().await.unwrap();
+        conn.execute("DELETE FROM agent_jobs WHERE id = $1", &[&ctx.job_id])
+            .await
+            .unwrap();
     }
 }

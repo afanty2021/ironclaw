@@ -1994,28 +1994,33 @@ impl WasmChannel {
             return Ok(());
         }
 
-        let tx_guard = self.message_tx.read().await;
-        let Some(tx) = tx_guard.as_ref() else {
-            tracing::error!(
-                channel = %self.name,
-                count = messages.len(),
-                "Messages emitted but no sender available - channel may not be started!"
-            );
-            return Ok(());
+        // Clone sender to avoid holding RwLock read guard across send().await in the loop
+        let tx = {
+            let tx_guard = self.message_tx.read().await;
+            let Some(tx) = tx_guard.as_ref() else {
+                tracing::error!(
+                    channel = %self.name,
+                    count = messages.len(),
+                    "Messages emitted but no sender available - channel may not be started!"
+                );
+                return Ok(());
+            };
+            tx.clone()
         };
 
-        let mut rate_limiter = self.rate_limiter.write().await;
-
         for emitted in messages {
-            // Check rate limit
-            if !rate_limiter.check_and_record() {
-                tracing::warn!(
-                    channel = %self.name,
-                    "Message emission rate limited"
-                );
-                return Err(WasmChannelError::EmitRateLimited {
-                    name: self.name.clone(),
-                });
+            // Check rate limit — acquire and release the write lock before send().await
+            {
+                let mut rate_limiter = self.rate_limiter.write().await;
+                if !rate_limiter.check_and_record() {
+                    tracing::warn!(
+                        channel = %self.name,
+                        "Message emission rate limited"
+                    );
+                    return Err(WasmChannelError::EmitRateLimited {
+                        name: self.name.clone(),
+                    });
+                }
             }
 
             // Convert to IncomingMessage
@@ -2057,7 +2062,7 @@ impl WasmChannel {
                 self.update_broadcast_metadata(&emitted.metadata_json).await;
             }
 
-            // Send to stream
+            // Send to stream — no locks held across this await
             tracing::info!(
                 channel = %self.name,
                 user_id = %emitted.user_id,
@@ -2281,28 +2286,33 @@ impl WasmChannel {
             "Processing emitted messages from polling callback"
         );
 
-        let tx_guard = message_tx.read().await;
-        let Some(tx) = tx_guard.as_ref() else {
-            tracing::error!(
-                channel = %channel_name,
-                count = messages.len(),
-                "Messages emitted but no sender available - channel may not be started!"
-            );
-            return Ok(());
+        // Clone sender to avoid holding RwLock read guard across send().await in the loop
+        let tx = {
+            let tx_guard = message_tx.read().await;
+            let Some(tx) = tx_guard.as_ref() else {
+                tracing::error!(
+                    channel = %channel_name,
+                    count = messages.len(),
+                    "Messages emitted but no sender available - channel may not be started!"
+                );
+                return Ok(());
+            };
+            tx.clone()
         };
 
-        let mut limiter = rate_limiter.write().await;
-
         for emitted in messages {
-            // Check rate limit
-            if !limiter.check_and_record() {
-                tracing::warn!(
-                    channel = %channel_name,
-                    "Message emission rate limited"
-                );
-                return Err(WasmChannelError::EmitRateLimited {
-                    name: channel_name.to_string(),
-                });
+            // Check rate limit — acquire and release the write lock before send().await
+            {
+                let mut limiter = rate_limiter.write().await;
+                if !limiter.check_and_record() {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        "Message emission rate limited"
+                    );
+                    return Err(WasmChannelError::EmitRateLimited {
+                        name: channel_name.to_string(),
+                    });
+                }
             }
 
             // Convert to IncomingMessage
@@ -2350,7 +2360,7 @@ impl WasmChannel {
                 .await;
             }
 
-            // Send to stream
+            // Send to stream — no locks held across this await
             tracing::info!(
                 channel = %channel_name,
                 user_id = %emitted.user_id,
@@ -3059,6 +3069,7 @@ mod tests {
     };
     use crate::channels::wasm::wrapper::{HttpResponse, WasmChannel};
     use crate::pairing::PairingStore;
+    use crate::testing::credentials::TEST_TELEGRAM_BOT_TOKEN;
     use crate::tools::wasm::ResourceLimits;
 
     fn create_test_channel() -> WasmChannel {
@@ -4009,7 +4020,7 @@ mod tests {
         let mut creds = std::collections::HashMap::new();
         creds.insert(
             "TELEGRAM_BOT_TOKEN".to_string(),
-            "8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis".to_string(),
+            TEST_TELEGRAM_BOT_TOKEN.to_string(),
         );
         creds.insert("OTHER_SECRET".to_string(), "s3cret".to_string());
 
@@ -4022,13 +4033,15 @@ mod tests {
             Arc::new(PairingStore::new()),
         );
 
-        let error = "HTTP request failed: error sending request for url \
-            (https://api.telegram.org/bot8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis/getUpdates)";
+        let error = format!(
+            "HTTP request failed: error sending request for url \
+            (https://api.telegram.org/bot{TEST_TELEGRAM_BOT_TOKEN}/getUpdates)"
+        );
 
-        let redacted = store.redact_credentials(error);
+        let redacted = store.redact_credentials(&error);
 
         assert!(
-            !redacted.contains("8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis"),
+            !redacted.contains(TEST_TELEGRAM_BOT_TOKEN),
             "credential value should be redacted"
         );
         assert!(

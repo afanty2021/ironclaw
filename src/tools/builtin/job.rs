@@ -411,7 +411,19 @@ impl CreateJobTool {
             // loop stops consuming from inject_tx the send will fail and the
             // monitor terminates. No JoinHandle is retained.
             if let (Some(etx), Some(itx)) = (&self.event_tx, &self.inject_tx) {
-                crate::agent::job_monitor::spawn_job_monitor(job_id, etx.subscribe(), itx.clone());
+                if let Some(route) = monitor_route_from_ctx(ctx) {
+                    crate::agent::job_monitor::spawn_job_monitor(
+                        job_id,
+                        etx.subscribe(),
+                        itx.clone(),
+                        route,
+                    );
+                } else {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        "Skipping job monitor injection due to missing route metadata"
+                    );
+                }
             }
 
             let result = serde_json::json!({
@@ -674,6 +686,37 @@ fn resolve_project_dir(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| project_id.to_string());
     Ok((canonical_dir, browse_id))
+}
+
+fn monitor_route_from_ctx(ctx: &JobContext) -> Option<crate::agent::job_monitor::JobMonitorRoute> {
+    let channel = ctx
+        .metadata
+        .get("notify_channel")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let user_id = ctx
+        .metadata
+        .get("notify_user")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ctx.user_id)
+        .to_string();
+    let thread_id = ctx
+        .metadata
+        .get("notify_thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let metadata = ctx
+        .metadata
+        .get("notify_metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    Some(crate::agent::job_monitor::JobMonitorRoute {
+        channel,
+        user_id,
+        thread_id,
+        metadata,
+    })
 }
 
 #[async_trait]
@@ -1748,14 +1791,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_credentials_missing_secret() {
-        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
-        use secrecy::SecretString;
+        use crate::testing::credentials::test_secrets_store;
 
         let manager = Arc::new(ContextManager::new(5));
-        let key = "0123456789abcdef0123456789abcdef";
-        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
-        let secrets: Arc<dyn SecretsStore + Send + Sync> =
-            Arc::new(InMemorySecretsStore::new(crypto));
+        let secrets: Arc<dyn SecretsStore + Send + Sync> = Arc::new(test_secrets_store());
 
         let tool = CreateJobTool::new(manager).with_secrets(Arc::clone(&secrets));
 
@@ -1772,20 +1811,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_credentials_valid() {
-        use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto};
-        use secrecy::SecretString;
+        use crate::secrets::CreateSecretParams;
+        use crate::testing::credentials::{TEST_GITHUB_TOKEN, test_secrets_store};
 
         let manager = Arc::new(ContextManager::new(5));
-        let key = "0123456789abcdef0123456789abcdef";
-        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
-        let secrets: Arc<dyn SecretsStore + Send + Sync> =
-            Arc::new(InMemorySecretsStore::new(Arc::clone(&crypto)));
+        let secrets: Arc<dyn SecretsStore + Send + Sync> = Arc::new(test_secrets_store());
 
         // Store a secret
         secrets
             .create(
                 "user1",
-                CreateSecretParams::new("github_token", "ghp_test123"),
+                CreateSecretParams::new("github_token", TEST_GITHUB_TOKEN),
             )
             .await
             .unwrap();

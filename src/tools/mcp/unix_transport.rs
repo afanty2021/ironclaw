@@ -91,13 +91,27 @@ impl McpTransport for UnixMcpTransport {
         request: &McpRequest,
         _headers: &HashMap<String, String>,
     ) -> Result<McpResponse, ToolError> {
+        // JSON-RPC notifications (no id) are fire-and-forget: the server
+        // will not send a response, so we must not wait for one.
+        if request.id.is_none() {
+            let mut writer = self.writer.lock().await;
+            write_jsonrpc_line(&mut *writer, request).await?;
+            return Ok(McpResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: None,
+            });
+        }
+
+        let id = request.id.unwrap_or(0);
         let (tx, rx) = oneshot::channel();
 
         // Register the pending response handler before writing the request,
         // so we don't miss a fast response from the server.
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(request.id, tx);
+            pending.insert(id, tx);
         }
 
         // Write the request to the socket.
@@ -106,7 +120,7 @@ impl McpTransport for UnixMcpTransport {
             if let Err(e) = write_jsonrpc_line(&mut *writer, request).await {
                 // Remove the pending entry on write failure.
                 let mut pending = self.pending.lock().await;
-                pending.remove(&request.id);
+                pending.remove(&id);
                 return Err(e);
             }
         }
@@ -118,18 +132,18 @@ impl McpTransport for UnixMcpTransport {
             Ok(Err(_)) => {
                 // Sender was dropped (reader task ended). Clean up pending entry.
                 let mut pending = self.pending.lock().await;
-                pending.remove(&request.id);
+                pending.remove(&id);
                 Err(ToolError::ExternalService(format!(
-                    "[{}] MCP server closed connection before responding to request {}",
+                    "[{}] MCP server closed connection before responding to request {:?}",
                     self.server_name, request.id
                 )))
             }
             Err(_) => {
                 // Timeout: remove the pending entry.
                 let mut pending = self.pending.lock().await;
-                pending.remove(&request.id);
+                pending.remove(&id);
                 Err(ToolError::ExternalService(format!(
-                    "[{}] Timeout waiting for response to request {} after {:?}",
+                    "[{}] Timeout waiting for response to request {:?} after {:?}",
                     self.server_name, request.id, timeout
                 )))
             }
@@ -237,7 +251,7 @@ mod tests {
         let headers = HashMap::new();
         let response = transport.send(&request, &headers).await.expect("send");
 
-        assert_eq!(response.id, 42);
+        assert_eq!(response.id, Some(42));
         assert!(response.result.is_some());
         assert!(response.error.is_none());
 
