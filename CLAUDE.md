@@ -35,12 +35,15 @@ All I/O is async with tokio. Use `Arc<T>` for shared state, `RwLock` for concurr
 
 ## Extracted Crates
 
-Safety logic lives in `crates/ironclaw_safety/`. The `src/safety/mod.rs` shim re-exports everything for backward compatibility, but **new code should import from `ironclaw_safety` directly** (e.g. `use ironclaw_safety::SafetyLayer`). When touching a file that still uses `crate::safety::*`, migrate its imports to `ironclaw_safety::*`.
+- **`crates/ironclaw_common/`** (v0.1.0) — Shared types and utilities. Contains `AppEvent` (the real-time event protocol used across SSE/WebSocket), and common utility functions.
+
+- **`crates/ironclaw_safety/`** (v0.2.0) — Prompt injection, validation, leak detection, policy. The `src/safety/mod.rs` shim re-exports everything for backward compatibility, but **new code should import from `ironclaw_safety` directly** (e.g. `use ironclaw_safety::SafetyLayer`). When touching a file that still uses `crate::safety::*`, migrate its imports to `ironclaw_safety::*`.
 
 ## Project Structure
 
 ```
 crates/
+├── ironclaw_common/    # Shared types: AppEvent (real-time event protocol), utilities
 └── ironclaw_safety/    # Extracted: prompt injection, validation, leak detection, policy
 
 src/
@@ -52,24 +55,29 @@ src/
 ├── service.rs          # OS service management (launchd/systemd daemon install)
 ├── tracing_fmt.rs      # Custom tracing formatter
 ├── util.rs             # Shared utilities
+├── tenant.rs           # Compile-time tenant isolation (TenantScope / AdminScope)
+├── profile.rs          # Psychographic profile types, 9-dimension analysis framework
 ├── config/             # Configuration from env vars (split by subsystem)
 │   ├── mod.rs          # Re-exports all config types; top-level Config struct
 │   ├── agent.rs, llm.rs, channels.rs, database.rs, sandbox.rs, skills.rs
 │   ├── heartbeat.rs, routines.rs, safety.rs, embeddings.rs, wasm.rs
 │   ├── tunnel.rs       # Tunnel provider config (TUNNEL_PROVIDER, TUNNEL_URL, etc.)
+│   ├── workspace.rs    # WorkspaceConfig: memory layers, read scopes
 │   └── secrets.rs, hygiene.rs, builder.rs, helpers.rs
 ├── error.rs            # Error types (thiserror)
 │
 ├── agent/              # Core agent loop, dispatcher, scheduler, sessions — see src/agent/CLAUDE.md
 │
 ├── channels/           # Multi-channel input
-│   ├── channel.rs      # Channel trait, IncomingMessage, OutgoingResponse
+│   ├── channel.rs      # Channel trait, IncomingMessage, OutgoingResponse, StatusUpdate (incl. ReasoningUpdate, TurnCost)
 │   ├── manager.rs      # ChannelManager merges streams
 │   ├── cli/            # Full TUI with Ratatui
 │   ├── http.rs         # HTTP webhook (axum) with secret validation
 │   ├── webhook_server.rs # Unified HTTP server composing all webhook routes
 │   ├── repl.rs         # Simple REPL (for testing)
 │   ├── web/            # Web gateway (browser UI) — see src/channels/web/CLAUDE.md
+│   │   └── handlers/
+│   │       └── webhooks.rs  # Public webhook trigger endpoint for routines
 │   └── wasm/           # WASM channel runtime
 │       ├── mod.rs
 │       ├── bundled.rs  # Bundled channel discovery
@@ -80,13 +88,21 @@ src/
 │       └── wrapper.rs  # Channel trait wrapper for WASM modules
 │
 ├── cli/                # CLI subcommands (clap)
-│   ├── mod.rs          # Cli struct, Command enum (run/onboard/config/tool/registry/mcp/memory/pairing/service/doctor/status/completion)
+│   ├── mod.rs          # Cli struct, Command enum (run/onboard/config/tool/registry/mcp/memory/pairing/service/doctor/status/models/hooks/fmt/completion)
+│   ├── models.rs       # `ironclaw models` subcommands (list/status/set/set-provider)
+│   ├── hooks.rs        # `ironclaw hooks list` — discoverable lifecycle hooks
+│   ├── fmt.rs          # Shared terminal design system (colors, width, NO_COLOR)
+│   ├── routines.rs     # Routine management subcommands
+│   ├── oauth_defaults.rs # OAuth provider defaults and credential management
 │   └── config.rs, tool.rs, registry.rs, mcp.rs, memory.rs, pairing.rs, service.rs, doctor.rs, status.rs, completion.rs
 │
 ├── registry/           # Extension registry catalog
 │   ├── manifest.rs     # ExtensionManifest, ArtifactSpec, BundleDefinition types
 │   ├── catalog.rs      # RegistryCatalog: load from filesystem and embedded JSON
 │   └── installer.rs    # RegistryInstaller: download, verify, install WASM artifacts
+│
+├── extensions/         # Extension manager (MCP servers, WASM channels/tools, auth)
+│   └── manager.rs      # ExtensionManager: discovery, lifecycle, credential injection
 │
 ├── hooks/              # Lifecycle hooks (6 points: BeforeInbound, BeforeToolCall, BeforeOutbound, OnSessionStart, OnSessionEnd, TransformResponse)
 │
@@ -114,11 +130,24 @@ src/
 ├── safety/             # Re-export shim for crates/ironclaw_safety (see Extracted Crates)
 │
 ├── llm/                # Multi-provider LLM integration — see src/llm/CLAUDE.md
+│   ├── nearai_chat.rs  # NearAI provider (default)
+│   ├── gemini_oauth.rs # Gemini CLI OAuth integration (Cloud Code API)
+│   ├── github_copilot.rs   # GitHub Copilot provider (device login → session token exchange)
+│   ├── github_copilot_auth.rs # Copilot authentication flow
+│   ├── openai_codex_provider.rs # OpenAI Codex Responses API (ChatGPT subscription)
+│   ├── openai_codex_session.rs  # Codex session management
+│   ├── token_refreshing.rs  # Token-refreshing decorator for OAuth providers
+│   ├── transcription/  # Audio transcription modules (moved from src/transcription)
+│   ├── retry.rs        # LLM request retry logic
+│   └── reasoning.rs    # Per-tool reasoning support
 │
 ├── tools/              # Extensible tool system
-│   ├── tool.rs         # Tool trait, ToolOutput, ToolError
+│   ├── tool.rs         # Tool trait, ToolOutput, ToolError, RiskLevel, ApprovalRequirement
 │   ├── registry.rs     # ToolRegistry for discovery
 │   ├── rate_limiter.rs # Shared sliding-window rate limiter
+│   ├── autonomy.rs     # Autonomous tool access control (denylist, availability checks)
+│   ├── coercion.rs     # Parameter type coercion (oneOf/anyOf/allOf schemas)
+│   ├── schema_validator.rs # OpenAI strict-mode JSON schema validation
 │   ├── builtin/        # Built-in tools (echo, time, json, http, web_fetch, file, shell, memory, message, job, routine, extension_tools, skill_tools, secrets_tools)
 │   ├── builder/        # Dynamic tool building
 │   │   ├── core.rs     # BuildRequirement, SoftwareType, Language
@@ -129,7 +158,8 @@ src/
 │   │   ├── client.rs   # MCP client over HTTP
 │   │   ├── factory.rs  # create_client_from_config() — transport dispatch factory
 │   │   ├── protocol.rs # JSON-RPC types
-│   │   └── session.rs  # MCP session management (Mcp-Session-Id header, per-server state)
+│   │   ├── session.rs  # MCP session management (Mcp-Session-Id header, per-server state)
+│   │   └── http_transport.rs # Streamable HTTP transport (POST + SSE)
 │   └── wasm/           # Full WASM sandbox (wasmtime)
 │       ├── runtime.rs  # Module compilation and caching
 │       ├── wrapper.rs  # Tool trait wrapper for WASM modules
@@ -145,6 +175,13 @@ src/
 ├── db/                 # Dual-backend persistence (PostgreSQL + libSQL) — see src/db/CLAUDE.md
 │
 ├── workspace/          # Persistent memory system — see src/workspace/README.md
+│   ├── layer.rs        # Memory layers with sensitivity levels (Private / Shared)
+│   ├── privacy.rs      # Regex-based privacy classification for memory redirects
+│   ├── repository.rs   # PostgreSQL repository for workspace persistence
+│   └── seeds/          # Default workspace seed files
+│       ├── AGENTS.md   # Coding agents guidance
+│       ├── SOUL.md, IDENTITY.md, USER.md  # Identity documents
+│       ├── HEARTBEAT.md, BOOTSTRAP.md, GREETING.md, MEMORY.md, TOOLS.md, README.md
 │
 ├── context/            # Job context isolation (JobState, JobContext, ContextManager)
 ├── estimation/         # Cost/time/value estimation with EMA learning
@@ -158,16 +195,17 @@ src/
 │
 ├── secrets/            # Secrets management (AES-256-GCM, OS keychain for master key)
 │
-├── profile.rs          # Psychographic profile types, 9-dimension analysis framework
-│
 ├── setup/              # 7-step onboarding wizard — see src/setup/README.md
+│   └── profile_evolution.rs # Weekly psychographic profile re-analysis prompts
 │
 ├── skills/             # SKILL.md prompt extension system — see .claude/rules/skills.md
+│   ├── delegation/SKILL.md     # Delegation skill
+│   └── routine-advisor/SKILL.md # Routine advisor skill
 │
 └── history/            # Persistence (PostgreSQL repositories, analytics)
 
 tests/
-├── *.rs                # Integration tests (workspace, heartbeat, WS gateway, pairing, etc.)
+├── *.rs                # Integration tests (workspace, heartbeat, WS gateway, pairing, multi-tenant, etc.)
 ├── test-pages/         # HTML→Markdown conversion fixtures
 └── e2e/                # Python/Playwright E2E scenarios (see tests/e2e/CLAUDE.md)
 ```
@@ -212,7 +250,28 @@ SKILL.md files extend the agent's prompt with domain-specific instructions. See 
 
 ## Configuration
 
-See `.env.example` for all environment variables. LLM backends (`nearai`, `openai`, `anthropic`, `ollama`, `openai_compatible`, `tinfoil`, `bedrock`) documented in `src/llm/CLAUDE.md`.
+See `.env.example` for all environment variables. LLM backends (`nearai`, `openai`, `anthropic`, `ollama`, `openai_compatible`, `tinfoil`, `bedrock`, `gemini_oauth`, `openai_codex`, `github_copilot`) documented in `src/llm/CLAUDE.md`.
+
+### Key New Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `WORKSPACE_READ_SCOPES` | Comma-separated additional user scopes for workspace reads |
+| `GATEWAY_USER_TOKENS` | JSON map of token→user for multi-user gateway mode |
+| `SHELL_RISK_LEVEL` | Shell command risk level: `low`, `medium`, `high` (graduated approval) |
+
+## Multi-Tenant Isolation
+
+Compile-time tenant isolation via `src/tenant.rs`. Two database access tiers:
+
+- **`TenantScope`** (default): All operations bound to a single user. ID-based lookups return `None` if the resource doesn't belong to this user.
+- **`AdminScope`**: Cross-tenant access for system-level operations (heartbeat, routine engine, self-repair). Must be obtained explicitly.
+
+Gateway supports multi-user mode via `GATEWAY_USER_TOKENS` (JSON map of token→user config with per-user `workspace_read_scopes`). Falls back to single-user `auth_token` + `user_id`.
+
+## Shell Risk Levels
+
+Shell tool supports graduated command approval via `RiskLevel` (Low / Medium / High). Configurable via `SHELL_RISK_LEVEL` env var. Each level determines which commands run autonomously vs. require user approval. See `src/tools/builtin/shell.rs`.
 
 ## Adding a New Channel
 
@@ -224,6 +283,14 @@ See `.env.example` for all environment variables. LLM backends (`nearai`, `opena
 ## Workspace & Memory
 
 Persistent memory with hybrid search (FTS + vector via RRF). Four tools: `memory_search`, `memory_write`, `memory_read`, `memory_tree`. Identity files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md) injected into system prompt. Heartbeat system runs proactive periodic execution (default: 30 minutes), reading `HEARTBEAT.md` and notifying via channel if findings. See `src/workspace/README.md`.
+
+### Layered Memory
+
+Memory is organized into layers with sensitivity levels (`Private` / `Shared`). Privacy classification via regex-based detection in `workspace/privacy.rs` routes sensitive content to private layers. Multi-scope workspace reads allow reading from additional user scopes while writes remain isolated. See `workspace/layer.rs`.
+
+### Seed Files
+
+Default workspace identity and behavior files in `src/workspace/seeds/`: AGENTS.md, SOUL.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, GREETING.md, MEMORY.md, TOOLS.md, README.md.
 
 ## Debugging
 
@@ -237,8 +304,9 @@ RUST_LOG=ironclaw=debug,tower_http=debug cargo run  # + HTTP request logging
 
 1. Domain-specific tools (`marketplace.rs`, `restaurant.rs`, etc.) are stubs
 2. Integration tests need testcontainers for PostgreSQL
-3. MCP: no streaming support; stdio/HTTP/Unix transports all use request-response
+3. MCP: Streamable HTTP supported; stdio/Unix transports use request-response
 4. WIT bindgen: auto-extract tool schema from WASM is stubbed
 5. Built tools get empty capabilities; need UX for granting access
 6. No tool versioning or rollback
 7. Observability: only `log` and `noop` backends (no OpenTelemetry)
+8. Multi-tenant isolation is complete but single-user mode remains the default
